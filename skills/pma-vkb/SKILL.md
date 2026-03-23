@@ -1,5 +1,6 @@
 ---
 name: pma-vkb
+version: 1.0.0
 description: >
   Project development lifecycle management with a strict three-phase
   workflow (investigate → proposal → implement), file-based task tracking

@@ -1,0 +1,5 @@
+{
+  "name": "pma-vkb",
+  "version": "1.0.0",
+  "description": "Project management + Vibe Kanban orchestration plugin with three-phase workflow and parallel agent dispatch"
+}
