@@ -8,9 +8,16 @@ description: >
   orchestration for parallel agent dispatch via isolated workspaces.
   Use when handling feature development, bug fixes, refactors, planning,
   progress tracking, multi-agent parallel execution, or any code change
-  in an existing codebase. Automatically invoked for all implementation
-  tasks — the agent must not write code without first completing the
-  investigation and proposal phases.
+  in an existing codebase. Trigger this skill whenever the user asks to
+  fix a bug, add a feature, refactor code, or make any code change —
+  even small ones. Also trigger when they mention task tracking, project
+  planning, work coordination, or want to dispatch multiple agents in
+  parallel. Automatically invoked for all implementation tasks — the
+  agent should not write code without first completing the investigation
+  and proposal phases.
+compatibility:
+  tools:
+    - mcp__vibe_kanban__* (optional — gracefully degrades to PMA-only mode)
 ---
 
 # PMA-VKB — Project Management + Vibe Kanban Orchestration
@@ -21,7 +28,7 @@ Run delivery work with clear gates, minimal diffs, explicit task/plan tracking, 
 
 ## Hard Rules
 
-1. All conversation output, generated documents, task files, plan files, commit messages, and PR content MUST be in Chinese. Skill definitions and config files stay in English.
+1. All conversation output, generated documents, task files, plan files, commit messages, and PR content are in Chinese. Skill definitions and config files stay in English.
 2. Use English filenames only (e.g. `architecture.md`, `changelog.md`).
 3. Read before write: inspect call chains, related config/tests, and recent changelog context before editing logic.
 4. Make only the minimal requested changes; do not add unrequested refactors or features.
@@ -77,7 +84,7 @@ Call `mcp__vibe_kanban__list_projects(organization_id = ORG_ID)`.
   2. Substring match: project `name` contained in directory name, or vice versa.
 
 - **If exactly one project matches** → set `PROJECT_ID` to its `id`.
-- **If multiple projects match, or no project matches** → you **MUST** ask the user. Output:
+- **If multiple projects match, or no project matches** → ask the user. Output:
   ```
   VKB 中有以下 Project，请选择用于本次任务的 Project：
   1. {project_name_1} ({project_id_1})
@@ -87,7 +94,7 @@ Call `mcp__vibe_kanban__list_projects(organization_id = ORG_ID)`.
   请输入 Project 编号或名称:
   ```
   Wait for user response. Set `PROJECT_ID` to the chosen project's `id`.
-  **Do NOT guess or auto-select when ambiguous. Always ask.**
+  Do not guess or auto-select when ambiguous — always ask.
 
 ### 1.3 Resolve Repository
 
@@ -219,298 +226,24 @@ First, determine which implementation path to take:
 - **Path A (VKB Orchestration)**: `VKB_MODE = true` AND the proposal includes a sub-task split table (Section 3.2).
 - **Path B (PMA-only)**: `VKB_MODE = false` OR the task is not parallelizable (no sub-task table).
 
-### CRITICAL RULE: Path A is MANDATORY when conditions are met
+### Why Path A and Path B are mutually exclusive
 
-If `VKB_MODE = true` AND a sub-task split table exists in the proposal, you **MUST** use Path A. You are **FORBIDDEN** from implementing code directly in the main workspace. The main workspace is the **orchestrator** — it creates VKB sub-issues, dispatches sub-workspaces, monitors their progress, and merges their branches. It does NOT write application code itself.
+When VKB orchestration is active and sub-tasks have been defined, the main workspace acts purely as an **orchestrator** — it creates VKB issues, dispatches sub-workspaces, monitors progress, and merges branches. It does not write application code itself, because sub-workspace agents own the implementation and their branches would conflict with direct edits on the main branch.
 
-The ONLY code the main workspace may write directly:
+The only code the main workspace may write directly:
 - `docs/task/` and `docs/plan/` files
-- Project scaffolding that must exist BEFORE sub-tasks can run (e.g. `create-next-app` initialization, `package.json`, base config files)
+- Project scaffolding that must exist before sub-tasks can run (e.g. `create-next-app` initialization, `package.json`, base config files)
 - Merge commits when combining sub-task branches
-
-All feature implementation code MUST be done by sub-workspace agents.
 
 ---
 
 ### Path A: VKB Orchestration
 
-#### A1. Claim Task in Docs
+When `VKB_MODE = true` and a sub-task split table exists, follow the full A1–A10 procedure in [docs/vkb-orchestration.md](docs/vkb-orchestration.md).
 
-1. Update `docs/task/index.md`: change the task marker from `[ ]` to `[-]`.
-2. Update the task detail file: set `status: in_progress`, set `owner: pma-vkb-orchestrator`.
-3. If a plan exists, update `docs/plan/index.md`: change `[ ]` to `[-]`. Update plan detail: set `status: implementing`.
+**Summary**: claim task in docs → create sub-task docs → create VKB parent/child issues → create blocking relationships → dispatch sub-workspaces → monitor loop (poll VKB status, resolve branches, dispatch unblocked tasks, handle stalls) → merge branches in topological order → cleanup and completion.
 
-#### A2. Create Sub-Task Docs
-
-For each sub-task in the split table:
-1. Create `docs/task/SUB-NNN.md` using the Chinese template. Set `status: pending`, `priority` from the table, `blocked by` from the DAG.
-2. Append to `docs/task/index.md`:
-   ```
-   - [ ] [**SUB-NNN 标题**](SUB-NNN.md) `P1`
-   ```
-
-#### A3. Create VKB Parent Issue
-
-Call:
-```
-mcp__vibe_kanban__create_issue(
-  project_id = PROJECT_ID,
-  title      = "{TASK_ID} {task title}",
-  description = "编排任务（main workspace 执行）。\n详见 docs/plan/PLAN-NNN.md",
-  priority   = "high"
-)
-```
-→ Store the returned `issue_id` as `PARENT_ISSUE_ID`.
-
-Record `PARENT_ISSUE_ID` in the task detail file under Notes.
-
-#### A4. Link Main Workspace
-
-If `MAIN_WORKSPACE_ID` is not null:
-```
-mcp__vibe_kanban__link_workspace_issue(
-  workspace_id = MAIN_WORKSPACE_ID,
-  issue_id     = PARENT_ISSUE_ID
-)
-```
-
-This makes the current workspace the **main workspace** and the current session the **main session**. The parent issue status will auto-change to "In progress".
-
-#### A5. Create VKB Child Issues
-
-For each sub-task, call:
-```
-mcp__vibe_kanban__create_issue(
-  project_id      = PROJECT_ID,
-  title           = "{SUB-NNN} {sub-task title}",
-  description     = <rendered from subtask-prompt-template.md — see docs/subtask-prompt-template.md>,
-  priority        = <from split table>,
-  parent_issue_id = PARENT_ISSUE_ID
-)
-```
-→ Store each returned `issue_id` in a map: `SUB_ISSUES[SUB-NNN] = {issue_id, branch: null, workspace_id: null}`.
-
-#### A6. Create Blocking Relationships
-
-For each dependency pair in the DAG (e.g. SUB-001 blocks SUB-002):
-```
-mcp__vibe_kanban__create_issue_relationship(
-  issue_id         = SUB_ISSUES["SUB-001"].issue_id,
-  related_issue_id = SUB_ISSUES["SUB-002"].issue_id,
-  relationship_type = "blocking"
-)
-```
-
-#### A7. Dispatch Sub Workspaces
-
-Identify sub-tasks with **no unresolved dependencies** (nothing blocks them, or all blockers are already Done).
-
-For each such sub-task:
-```
-mcp__vibe_kanban__start_workspace(
-  name         = "{SUB-NNN}-{short-description}",
-  executor     = "CLAUDE_CODE",
-  repositories = [{"repo_id": REPO_ID, "branch": CURRENT_BRANCH}],
-  issue_id     = SUB_ISSUES["SUB-NNN"].issue_id
-)
-```
-→ Store returned `workspace_id` in `SUB_ISSUES["SUB-NNN"].workspace_id`.
-
-Then update docs:
-1. `docs/task/SUB-NNN.md`: set `status: in_progress`, set `owner: vkb-workspace`.
-2. `docs/task/index.md`: change `[ ]` to `[-]` for this sub-task.
-
-#### A8. Monitoring Loop
-
-**Hard limits**: Maximum **20 poll iterations**. Each iteration starts with a `sleep` of at least **60 seconds** (this is the minimum; increase if sub-tasks are large). If all 20 iterations are exhausted without completion, STOP and inform the user.
-
-Repeat the following until **all sub-tasks are in a terminal state** (Done or failed-and-handled) or the iteration limit is reached:
-
-**Step 8a — Wait, then query VKB statuses:**
-```bash
-sleep 60
-```
-```
-mcp__vibe_kanban__list_issues(
-  project_id      = PROJECT_ID,
-  parent_issue_id = PARENT_ISSUE_ID
-)
-```
-Record each issue's `status`.
-
-**Step 8b — Resolve branches (first iteration + after new dispatches):**
-
-On the first iteration, and whenever new sub-tasks were dispatched in Step 8d of a previous iteration, get branch names for sub workspaces:
-```
-mcp__vibe_kanban__list_workspaces()
-```
-Match by `workspace_id` → extract `branch`. Store in `SUB_ISSUES["SUB-NNN"].branch`.
-
-**Step 8c — Determine completion:**
-
-A sub-task is considered **complete** when its VKB issue status is **"Done"**.
-
-As a secondary signal, for "In progress" sub-tasks, check git activity:
-```bash
-git fetch origin
-git log origin/{branch} --oneline -1
-```
-
-When a sub-task's VKB status is Done:
-1. Update `docs/task/SUB-NNN.md`: set `status: completed`.
-2. Update `docs/task/index.md`: change `[-]` to `[x]`.
-
-**Step 8d — Dispatch newly unblocked sub-tasks:**
-
-For each sub-task still in "pending" state:
-- Check if ALL its blocking dependencies are now Done.
-- If yes → dispatch it (same as Step A7).
-
-**Step 8e — Handle stalls:**
-
-If a sub-task has been "In progress" for **3+ consecutive polls** with no new commits on its branch:
-1. Attempt recovery: call `mcp__vibe_kanban__create_session(workspace_id = SUB_ISSUES["SUB-NNN"].workspace_id)` then `mcp__vibe_kanban__run_session_prompt(session_id = <new_session_id>, prompt = "继续完成上一个 session 未完成的任务。")`.
-2. If still no progress after **3 more polls** → mark as failed:
-   - Update `docs/task/SUB-NNN.md`: append failure details to Notes.
-   - Inform user: "子任务 {SUB-NNN} 执行失败，请检查。"
-   - Do NOT block other sub-tasks.
-
-**Step 8f — Output progress report:**
-
-After each poll cycle, output a **concise** status line per sub-task (do NOT repeat full tables every iteration to conserve context window):
-
-```
-[轮询 {N}/20] SUB-001: Done ✓ | SUB-002: In progress (3 commits) | SUB-003: blocked
-```
-
-Every **5th iteration**, output the full table and append to `docs/task/{TASK_ID}.md` under Notes:
-
-```
-## 执行进度 — {TASK_ID} (轮询 {N}/20)
-
-| 子任务 | VKB ID | 状态 | branch | 最新 commit |
-|--------|--------|------|--------|------------|
-| SUB-001 | BEN-XX | Done | feature/xxxx-... | abc1234 |
-| SUB-002 | BEN-YY | In progress | feature/yyyy-... | def5678 |
-| SUB-003 | BEN-ZZ | To do (blocked by SUB-001) | — | — |
-```
-
-**Step 8g — Iteration limit reached:**
-
-If 20 iterations are exhausted:
-```
-监控已达上限（20 轮）。当前状态：
-{full status table}
-请检查未完成的子任务后回复 `继续监控` 或 `跳到合并`。
-```
-
-#### A9. Merge Phase
-
-When **all sub-tasks** are Done (or failed sub-tasks have been acknowledged):
-
-1. Get each sub-task's branch from the cached `SUB_ISSUES` map.
-
-2. Fetch all remote branches:
-   ```bash
-   git fetch origin
-   ```
-
-3. Merge in **topological order** of the dependency DAG (dependencies first):
-   ```bash
-   git merge origin/{sub-branch-1} --no-ff --no-edit
-   ```
-   - If the merge succeeds → run the verification command from the merge strategy (e.g. `bun run lint && bun run test`).
-   - If the merge has conflicts → abort and **STOP**:
-     ```bash
-     git merge --abort
-     ```
-     Output:
-     ```
-     Merge 冲突：{sub-branch} → {CURRENT_BRANCH}
-     冲突文件：
-     - {file1}
-     - {file2}
-     已执行 git merge --abort 回滚。请选择：
-     1. 手动解决冲突后回复 `继续`
-     2. 跳过此子任务回复 `跳过 {SUB-NNN}`
-     ```
-     Wait for user to resolve and confirm before continuing.
-   - If verification fails after a successful merge → output the failure details and ask user:
-     ```
-     合并 {sub-branch} 后验证失败：
-     {failure details}
-     请选择：
-     1. `reset` — 回退到合并前状态（git reset --hard HEAD~1）
-     2. `继续` — 保留合并，手动修复后回复
-     ```
-     If user chooses `reset`, run `git reset --hard HEAD~1` and skip this sub-branch.
-
-4. After all branches are merged, run full verification:
-   ```bash
-   {project test/lint/build commands}
-   ```
-
-#### A10. Cleanup and Completion
-
-1. **Archive all sub workspaces:**
-   For each sub-task with a workspace_id:
-   ```
-   mcp__vibe_kanban__update_workspace(
-     workspace_id = SUB_ISSUES["SUB-NNN"].workspace_id,
-     archived     = true
-   )
-   ```
-
-2. **Update VKB parent issue:**
-   ```
-   mcp__vibe_kanban__update_issue(
-     issue_id = PARENT_ISSUE_ID,
-     status   = "Done"
-   )
-   ```
-
-3. **(Optional) Clean up remote sub-branches:**
-   ```bash
-   git push origin --delete {sub-branch-1} {sub-branch-2} ...
-   ```
-   Skip if the team prefers to keep branches for audit.
-
-4. **Push or confirm:**
-   Output:
-   ```
-   所有子任务已合并到 {CURRENT_BRANCH}。是否 push 到 origin？回复 `push` 执行，或自行操作。
-   ```
-   If user replies `push`:
-   ```bash
-   git push origin {CURRENT_BRANCH}
-   ```
-
-5. **Update PMA docs:**
-   - `docs/task/{TASK_ID}.md`: set `status: completed`, append completion summary to Notes.
-   - `docs/task/index.md`: change `[-]` to `[x]` for the main task.
-   - If a plan exists:
-     - `docs/plan/PLAN-NNN.md`: set `status: completed`.
-     - `docs/plan/index.md`: change `[-]` to `[x]`.
-   - `docs/changelog.md`: append entry:
-     ```markdown
-     ## YYYY-MM-DD HH:MM [进度]
-
-     {TASK_ID}: {task title} — 完成。
-     子任务: {list of SUB-NNN with VKB IDs}
-     ```
-
-6. **Output final report:**
-   ```
-   ## 完成报告 — {TASK_ID}
-
-   所有子任务已完成并合并。
-   | 子任务 | VKB ID | branch | 状态 |
-   |--------|--------|--------|------|
-   ...
-
-   验证结果: {pass/fail details}
-   分支合并: {merge summary}
-   ```
+The sub-task issue descriptions are rendered using the template in [docs/subtask-prompt-template.md](docs/subtask-prompt-template.md).
 
 ---
 
@@ -536,26 +269,6 @@ Run full project verification (test suite, lint, build).
 2. `docs/task/index.md`: `[-]` → `[x]`.
 3. If plan exists: `docs/plan/PLAN-NNN.md` → `status: completed`, `docs/plan/index.md` → `[x]`.
 4. `docs/changelog.md`: append entry.
-
----
-
-## Sub-Task Description Template
-
-When creating VKB child issues in Step A5, render the description using the template in [docs/subtask-prompt-template.md](docs/subtask-prompt-template.md). The template variables come from:
-
-| Variable | Source |
-|----------|--------|
-| `{title}` | Sub-task split table, column "标题" |
-| `{context}` | Plan file `PLAN-NNN.md`, section "现状" |
-| `{requirements}` | Plan file, section "方案", filtered to this sub-task's scope |
-| `{acceptance_criteria}` | Split table, column "验收标准" |
-| `{file_list}` | Split table, column "文件范围" |
-| `{new_files}` | Files to be created (from proposal) |
-| `{setup_command}` | Dependency install command (e.g. `bun install`, `npm ci`) |
-| `{test_command}` | Project's test command (from package.json, Makefile, etc.) |
-| `{lint_command}` | Project's lint command |
-| `{build_command}` | Project's build command |
-| `{reference_paths}` | Existing code patterns referenced in the proposal |
 
 ---
 
@@ -593,28 +306,12 @@ If any VKB call fails → log the error in the task detail Notes section. The do
 
 ---
 
-## Claim-Before-Work (Multi-Agent Safety)
-
-Before writing any implementation code:
-
-1. Read `docs/task/index.md`. For every `[-]` entry, read the detail file's `owner` field.
-2. If the target task's `owner` is set to a different agent → inform user and stop.
-3. Claim in docs:
-   - Update `docs/task/index.md`: `[ ]` → `[-]`.
-   - Update detail file: `status: in_progress`, `owner: pma-vkb-orchestrator`.
-4. If `VKB_MODE = true`, also use VKB issue assignment as the authoritative lock:
-   - `link_workspace_issue` auto-sets the issue to "In progress", which serves as a distributed lock visible to all agents.
-5. Only proceed to implementation after the claim is fully written.
-
-> **Note**: File-based claims are best-effort in multi-worktree setups (each worktree has its own working copy). When using VKB orchestration, the VKB issue status is the authoritative lock.
-
----
-
-## Task and Plan Format References
+## Format References
 
 - Task format: [docs/task-format.md](docs/task-format.md)
 - Plan format: [docs/plan-format.md](docs/plan-format.md)
 - Sub-task prompt template: [docs/subtask-prompt-template.md](docs/subtask-prompt-template.md)
+- VKB orchestration steps: [docs/vkb-orchestration.md](docs/vkb-orchestration.md)
 
 ---
 
