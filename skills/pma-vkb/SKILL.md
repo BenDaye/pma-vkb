@@ -1,11 +1,17 @@
 ---
 name: pma-vkb
-version: 1.1.0
+version: 2.0.0
 description: >
   Project development lifecycle management with a strict three-phase
   workflow (investigate → proposal → implement), file-based task tracking
   in docs/task/, plan tracking in docs/plan/, and Vibe Kanban MCP
   orchestration for parallel agent dispatch via isolated workspaces.
+  Supports recursive fission: complex tasks are automatically decomposed
+  into sub-tasks, each dispatched to its own workspace where the agent
+  independently decides whether to implement directly or fission further.
+  Only one user `proceed` is needed at the root session — all subsequent
+  orchestration (splitting, dispatching, reviewing, merging, reporting,
+  pushing) is fully automated.
   Use when handling feature development, bug fixes, refactors, planning,
   progress tracking, multi-agent parallel execution, or any code change
   in an existing codebase. Trigger this skill whenever the user asks to
@@ -33,9 +39,21 @@ Run delivery work with clear gates, minimal diffs, explicit task/plan tracking, 
 3. Read before write: inspect call chains, related config/tests, and recent changelog context before editing logic.
 4. Make only the minimal requested changes; do not add unrequested refactors or features.
 5. Never use plan mode (`EnterPlanMode`, `mode: "plan"`). Manage plans in `docs/plan/` files only.
-6. Do not implement before explicit confirmation (`proceed` / `开始实现`).
+6. Do not implement before explicit confirmation (`proceed` / `开始实现`) — **unless `AUTO_PROCEED = true`** (see Step 1.0).
 7. `docs/task/` and `docs/plan/` files are the **sole source of truth**. VKB state syncs FROM docs, never the reverse.
 8. VKB integration is pluggable. When VKB MCP is unavailable, degrade to PMA-only mode transparently.
+
+## Recursive Fission Limits
+
+When using recursive fission (sub-workspaces dispatching their own sub-workspaces), these hard limits apply to prevent runaway orchestration:
+
+| Limit | Value | Enforcement |
+|-------|-------|-------------|
+| **Max fission depth** | 3 levels | Level 0 = user-created root issue. Level 1 = first fission. Level 2 = second fission. Level 3 = must be leaf executor, no further fission allowed. |
+| **Max total issues per root task** | 30 | Before creating a child issue, count direct children via `list_issues(parent_issue_id=PARENT_ISSUE_ID)`. If the current parent already has children approaching the limit, stop fissioning. Since VKB only supports single-level parent queries, use a conservative estimate: `current_children_count × average_grandchildren ≤ 30`. |
+| **Max children per parent issue** | 8 | A single issue may have at most 8 direct child issues. |
+
+**Depth tracking**: Each orchestrator node template includes `{current_depth}` and `{root_issue_id}` variables. The root session sets depth = 0 and `root_issue_id` to `PARENT_ISSUE_ID`. Each fission increments depth by 1 and passes `root_issue_id` unchanged. When depth ≥ 3, the agent MUST use Path B (direct implementation) regardless of complexity.
 
 ---
 
@@ -58,9 +76,45 @@ Then proceed to Step 1.
 
 Execute these sub-steps **in order**. Cache every result for use in later steps.
 
+### 1.0 Detect Entry Mode
+
+Determine how this session was initiated.
+
+**Initialize defaults:**
+```
+ENTRY_MODE        = "workspace_driven"
+AUTO_PROCEED      = false
+IS_SUB_ORCHESTRATOR = false
+MAIN_WORKSPACE_ID = null
+LINKED_ISSUE_ID   = null
+CURRENT_DEPTH     = 0
+```
+
+Run `git branch --show-current` → store as `CURRENT_BRANCH`.
+
+Call `mcp__vibe_kanban__list_workspaces()`.
+
+- Iterate through workspaces. If any workspace `branch` equals `CURRENT_BRANCH`:
+  - Set `MAIN_WORKSPACE_ID` to its `id`.
+  - If the workspace has an associated `issue_id`:
+    - Call `mcp__vibe_kanban__get_issue(issue_id)` → read the issue's `title`, `description`, `project_id`, `parent_issue_id`.
+    - Set `ENTRY_MODE = "issue_driven"`.
+    - Set `LINKED_ISSUE_ID` to that `issue_id`.
+    - Set `PROJECT_ID` to the issue's `project_id`.
+    - **Auto-proceed detection**: If the issue `description` starts with `## 执行模式:`, this is a skill-generated issue. Set `AUTO_PROCEED = true`. The agent will skip the proceed gate (Step 3.4) and enter Phase 3 automatically after completing the proposal.
+    - If `parent_issue_id` is not null → set `IS_SUB_ORCHESTRATOR = true` (this workspace is a child of another orchestrator).
+    - Skip to Step 1.1 (VKB availability is already confirmed since the workspace call succeeded).
+  - If the workspace has no associated `issue_id`:
+    - Set `ENTRY_MODE = "workspace_driven"`.
+    - Continue to Step 1.1.
+- If no workspace matches `CURRENT_BRANCH`:
+  - Set `ENTRY_MODE = "workspace_driven"`.
+  - Set `MAIN_WORKSPACE_ID = null`.
+  - Continue to Step 1.1.
+
 ### 1.1 Detect VKB Availability
 
-Call `mcp__vibe_kanban__list_organizations()`.
+Call `mcp__vibe_kanban__list_organizations()`. This call is always needed — even in `issue_driven` mode — to obtain `ORG_ID` and `org_name` for the context output in Step 1.5.
 
 - **If the call fails or the tool does not exist**: set `VKB_MODE = false`. Output:
   ```
@@ -74,7 +128,11 @@ Call `mcp__vibe_kanban__list_organizations()`.
 
 ### 1.2 Resolve Project
 
-Call `mcp__vibe_kanban__list_projects(organization_id = ORG_ID)`.
+If `PROJECT_ID` was already set in Step 1.0 (issue_driven mode):
+- Call `mcp__vibe_kanban__list_projects(organization_id = ORG_ID)` → find the project matching `PROJECT_ID` to cache `project_name`.
+- Skip the rest of this step.
+
+Otherwise, call `mcp__vibe_kanban__list_projects(organization_id = ORG_ID)`.
 
 - If the project list is empty → output: "VKB 中没有 Project，请先在 Vibe Kanban UI 中创建（MCP 无 create_project 工具）。" Set `VKB_MODE = false`. Skip to Step 2.
 
@@ -105,10 +163,11 @@ Call `mcp__vibe_kanban__list_repos()`.
 
 ### 1.4 Identify Current Workspace
 
-Run `git branch --show-current` → store as `CURRENT_BRANCH`.
+If `MAIN_WORKSPACE_ID` was already set in Step 1.0, skip this step.
 
-Call `mcp__vibe_kanban__list_workspaces()`.
-
+Otherwise:
+- Run `git branch --show-current` → store as `CURRENT_BRANCH` (if not already set).
+- Call `mcp__vibe_kanban__list_workspaces()`.
 - Iterate through workspaces. If any workspace `branch` equals `CURRENT_BRANCH` → set `MAIN_WORKSPACE_ID` to its `id`.
 - If no match → set `MAIN_WORKSPACE_ID = null`. VKB orchestration is still possible; the workspace will be linked later.
 
@@ -118,10 +177,12 @@ Set `VKB_MODE = true`. Output:
 
 ```
 VKB 上下文已建立:
+  Entry Mode:   {ENTRY_MODE} {AUTO_PROCEED ? "(auto-proceed)" : ""}
   Organization: {org_name} ({ORG_ID})
   Project:      {project_name} ({PROJECT_ID})
   Repository:   {repo_name} ({REPO_ID})
   Workspace:    {ws_name} ({MAIN_WORKSPACE_ID}) @ {CURRENT_BRANCH}
+  Linked Issue: {LINKED_ISSUE_ID ? simple_id + " " + title : "(无)"}
 ```
 
 ---
@@ -176,7 +237,7 @@ If the change touches **≥ 3 files** or **crosses module boundaries**:
 
 ### 3.1 Output Proposal
 
-Output the following sections **in Chinese**, then **STOP and wait for user approval**:
+Output the following sections **in Chinese**:
 
 1. **现状**: What exists now (files, modules, current behavior).
 2. **方案**: What to change and how.
@@ -184,20 +245,48 @@ Output the following sections **in Chinese**, then **STOP and wait for user appr
 4. **工作量**: Estimated scope (files, modules affected).
 5. **备选方案**: Alternative approaches (if multiple exist).
 
-### 3.2 VKB Orchestration Plan (if VKB_MODE = true AND task is parallelizable)
+### 3.2 VKB Orchestration Plan (if VKB_MODE = true)
 
-A task is **parallelizable** when it can be split into ≥ 2 independent sub-tasks where each sub-task modifies a **disjoint set of files**.
+#### 3.2.1 Fission Judgment
 
-If parallelizable, output these additional sections:
+Based on investigation results, the agent evaluates the task's **fission level**:
+
+| Level | Name | Criteria | Action |
+|-------|------|----------|--------|
+| **DIRECT** | 直接实现 | ≤ 5 files AND single module/bounded context | Use Path B (direct implementation) |
+| **FISSION** | 裂变 | Can be split into ≥ 2 sub-tasks with disjoint file sets/modules | Split into sub-tasks via Path A. Each sub-task is classified as leaf or orchestrator (see 3.2.2). |
+
+The agent chooses DIRECT when possible. FISSION is used whenever the task is too large for direct implementation.
+
+**Key principle**: Each sub-task dispatched to a workspace runs the **same SKILL.md**. A sub-task classified as "orchestrator node" will run its own fission judgment — the recursive model handles multi-level decomposition naturally. The orchestrator only plans **one level down**.
+
+#### 3.2.2 Sub-Task Classification
+
+For each sub-task in the split, classify it:
+
+- **Leaf executor (叶子执行)**: The sub-task is small enough to implement directly. Use the leaf executor prompt template.
+- **Orchestrator node (编排节点)**: The sub-task is complex enough that it will likely need its own fission. Use the orchestrator node prompt template. The dispatched agent will run the full SKILL.md cycle (investigate → fission judgment → implement or sub-dispatch).
+
+Heuristics for classification:
+- Leaf: ≤ 5 files, single concern, clear acceptance criteria
+- Orchestrator: crosses module boundaries, >5 files, or the agent cannot yet enumerate all files (needs further investigation in context)
+
+#### 3.2.3 Output Format
+
+If fission level is FISSION, output these additional sections:
 
 6. **子任务拆分表**:
 
-   | 子任务 ID | 标题 | 文件范围 | 依赖 | 优先级 | 验收标准 |
-   |-----------|------|---------|------|--------|---------|
-   | SUB-001 | ... | src/hooks/... | 无 | high | ... |
-   | SUB-002 | ... | src/components/... | SUB-001 | high | ... |
+   | 子任务 ID | 标题 | 类型 | 文件范围 | 依赖 | 优先级 | 验收标准 |
+   |-----------|------|------|---------|------|--------|---------|
+   | SUB-001 | ... | 叶子 | src/hooks/... | 无 | high | ... |
+   | SUB-002 | ... | 编排 | src/modules/auth/ | SUB-001 | high | (子 workspace 自行调研) |
 
-7. **文件归属矩阵**: Confirm each file appears in **exactly one** sub-task. If any file appears in multiple sub-tasks, merge those sub-tasks or re-split.
+   - **类型** column: `叶子` (leaf executor) or `编排` (orchestrator node).
+   - For orchestrator nodes, **文件范围** can be a directory or module path (not exhaustive file list).
+   - For leaf executors, **文件范围** must list specific files.
+
+7. **文件归属矩阵**: Confirm each file/directory appears in **exactly one** sub-task. If any file appears in multiple sub-tasks, merge those sub-tasks or re-split.
 
 8. **依赖 DAG**: List blocking relationships. Example: `SUB-001 → blocks → SUB-002`.
 
@@ -209,22 +298,27 @@ If parallelizable, output these additional sections:
 
 If a plan file exists (`PLAN-NNN.md`), fill in all remaining sections (方案, 风险, 工作量, 备选方案, and the orchestration sections if applicable).
 
-### 3.4 STOP
+### 3.4 Proceed Gate
 
-Output: "方案已输出。请确认后回复 `proceed` 开始实现。"
+**If `AUTO_PROCEED = true`** (skill-generated issue, detected in Step 1.0):
+- Do NOT stop. Do NOT wait for user confirmation.
+- Output: "自动执行模式：跳过确认，直接进入实现阶段。"
+- Immediately proceed to Step 4.
 
-**Do not proceed until the user explicitly confirms.**
+**Otherwise** (user-created issue or workspace-driven entry):
+- Output: "方案已输出。请确认后回复 `proceed` 开始实现。"
+- **Do not proceed until the user explicitly confirms.**
 
 ---
 
 ## Step 4: Phase 3 — Implementation
 
-On receiving `proceed` (or `开始实现` or equivalent confirmation):
+On receiving `proceed` (or `开始实现` or equivalent confirmation), or when `AUTO_PROCEED = true`:
 
 First, determine which implementation path to take:
 
-- **Path A (VKB Orchestration)**: `VKB_MODE = true` AND the proposal includes a sub-task split table (Section 3.2).
-- **Path B (PMA-only)**: `VKB_MODE = false` OR the task is not parallelizable (no sub-task table).
+- **Path A (VKB Orchestration)**: `VKB_MODE = true` AND fission level is FISSION (Section 3.2.1).
+- **Path B (PMA-only)**: `VKB_MODE = false` OR fission level is DIRECT (no sub-task table).
 
 ### Why Path A and Path B are mutually exclusive
 
@@ -254,24 +348,31 @@ For each sub-task in the split table:
    - [ ] [**SUB-NNN 标题**](SUB-NNN.md) `P1`
    ```
 
-#### A3. Create VKB Parent Issue
+#### A3. Resolve or Create VKB Parent Issue
 
-Call:
-```
-mcp__vibe_kanban__create_issue(
-  project_id = PROJECT_ID,
-  title      = "{TASK_ID} {task title}",
-  description = "编排任务（main workspace 执行）。\n详见 docs/plan/PLAN-NNN.md",
-  priority   = "high"
-)
-```
-→ Store the returned `issue_id` as `PARENT_ISSUE_ID`.
+**If `ENTRY_MODE = "issue_driven"`** (workspace was started from an existing issue):
+- `PARENT_ISSUE_ID` is already set to `LINKED_ISSUE_ID` from Step 1.0.
+- Do NOT create a new issue. Skip to A4.
+
+**If `ENTRY_MODE = "workspace_driven"`** (no pre-existing issue):
+- Call:
+  ```
+  mcp__vibe_kanban__create_issue(
+    project_id = PROJECT_ID,
+    title      = "{TASK_ID} {task title}",
+    description = "编排任务（main workspace 执行）。\n详见 docs/plan/PLAN-NNN.md",
+    priority   = "high"
+  )
+  ```
+  → Store the returned `issue_id` as `PARENT_ISSUE_ID`.
 
 Record `PARENT_ISSUE_ID` in the task detail file under Notes.
 
 #### A4. Link Main Workspace
 
-If `MAIN_WORKSPACE_ID` is not null:
+**If `ENTRY_MODE = "issue_driven"`**: skip (workspace is already linked to the issue).
+
+**Otherwise**, if `MAIN_WORKSPACE_ID` is not null:
 ```
 mcp__vibe_kanban__link_workspace_issue(
   workspace_id = MAIN_WORKSPACE_ID,
@@ -283,17 +384,22 @@ This makes the current workspace the **main workspace** and the current session 
 
 #### A5. Create VKB Child Issues
 
-For each sub-task, call:
+For each sub-task in the split table, render the issue description based on its **type** (from Section 3.2.2):
+
+- **Leaf executor (叶子)**: render from the **leaf executor template** in [docs/subtask-prompt-template.md](docs/subtask-prompt-template.md).
+- **Orchestrator node (编排)**: render from the **orchestrator node template** in [docs/subtask-prompt-template.md](docs/subtask-prompt-template.md). Include `{plan_excerpt}` with the relevant sections from the current plan (现状, 方案, 风险) so the sub-orchestrator has full context.
+
+Then call:
 ```
 mcp__vibe_kanban__create_issue(
   project_id      = PROJECT_ID,
   title           = "{SUB-NNN} {sub-task title}",
-  description     = <rendered from subtask-prompt-template.md — see docs/subtask-prompt-template.md>,
+  description     = <rendered description>,
   priority        = <from split table>,
   parent_issue_id = PARENT_ISSUE_ID
 )
 ```
-→ Store each returned `issue_id` in a map: `SUB_ISSUES[SUB-NNN] = {issue_id, branch: null, workspace_id: null}`.
+→ Store each returned `issue_id` in a map: `SUB_ISSUES[SUB-NNN] = {issue_id, type: "leaf"|"orchestrator", branch: null, workspace_id: null}`.
 
 #### A6. Create Blocking Relationships
 
@@ -380,12 +486,25 @@ If a sub-task has been "In progress" for **3+ consecutive polls** with no new co
    - Inform user: "子任务 {SUB-NNN} 执行失败，请检查。"
    - Do NOT block other sub-tasks.
 
-**Step 8f — Output progress report:**
+**Step 8f — Recursive progress drill-down (for orchestrator-type sub-tasks):**
+
+Execute this step **every 3rd iteration** (iterations 3, 6, 9, ...) and on the **final iteration** to limit API call volume.
+
+For each sub-task with `type = "orchestrator"` that is "In progress":
+```
+mcp__vibe_kanban__list_issues(
+  project_id      = PROJECT_ID,
+  parent_issue_id = SUB_ISSUES["SUB-NNN"].issue_id
+)
+```
+If grandchild issues exist, include them in the progress report as nested entries. This provides visibility into the recursive fission without the main orchestrator needing to manage those grandchild tasks directly.
+
+**Step 8g — Output progress report:**
 
 After each poll cycle, output a **concise** status line per sub-task (do NOT repeat full tables every iteration to conserve context window):
 
 ```
-[轮询 {N}/20] SUB-001: Done ✓ | SUB-002: In progress (3 commits) | SUB-003: blocked
+[轮询 {N}/20] SUB-001: Done ✓ | SUB-002: In progress (3 commits) | SUB-003(编排): In progress (2/4 子任务完成)
 ```
 
 Every **5th iteration**, output the full table and append to `docs/task/{TASK_ID}.md` under Notes:
@@ -393,23 +512,28 @@ Every **5th iteration**, output the full table and append to `docs/task/{TASK_ID
 ```
 ## 执行进度 — {TASK_ID} (轮询 {N}/20)
 
-| 子任务 | VKB ID | 状态 | branch | 最新 commit |
-|--------|--------|------|--------|------------|
-| SUB-001 | BEN-XX | Done | feature/xxxx-... | abc1234 |
-| SUB-002 | BEN-YY | In progress | feature/yyyy-... | def5678 |
-| SUB-003 | BEN-ZZ | To do (blocked by SUB-001) | — | — |
+| 子任务 | VKB ID | 类型 | 状态 | branch | 最新 commit |
+|--------|--------|------|------|--------|------------|
+| SUB-001 | BEN-XX | 叶子 | Done | feature/xxxx-... | abc1234 |
+| SUB-002 | BEN-YY | 叶子 | In progress | feature/yyyy-... | def5678 |
+| SUB-003 | BEN-ZZ | 编排 | In progress | feature/zzzz-... | — |
+|   ↳ SUB-003/SUB-001 | BEN-AA | — | Done | feature/aaaa-... | ghi9012 |
+|   ↳ SUB-003/SUB-002 | BEN-BB | — | In progress | feature/bbbb-... | — |
 ```
 
-**Step 8g — Iteration limit reached:**
+**Step 8h — Iteration limit reached:**
 
 If 20 iterations are exhausted:
-```
-监控已达上限（20 轮）。当前状态：
-{full status table}
-请检查未完成的子任务后回复 `继续监控` 或 `跳到合并`。
-```
 
-#### A9. Merge Phase
+- **If `AUTO_PROCEED = true`** (sub-orchestrator): output the status table to the issue notes (via a commit message) and mark the issue as failed. The parent orchestrator will detect this.
+- **Otherwise** (root session with user present):
+  ```
+  监控已达上限（20 轮）。当前状态：
+  {full status table}
+  请检查未完成的子任务后回复 `继续监控` 或 `跳到合并`。
+  ```
+
+#### A9. Review & Merge Phase
 
 When **all sub-tasks** are Done (or failed sub-tasks have been acknowledged):
 
@@ -420,37 +544,62 @@ When **all sub-tasks** are Done (or failed sub-tasks have been acknowledged):
    git fetch origin
    ```
 
-3. Merge in **topological order** of the dependency DAG (dependencies first):
+3. **AI Code Review** — For each sub-task branch (in topological order), before merging:
+   ```bash
+   git diff {CURRENT_BRANCH}...origin/{sub-branch}
+   ```
+   Review the diff for:
+   - **Correctness**: Does the code match the sub-task's acceptance criteria?
+   - **Scope violation**: Does the diff touch files outside the sub-task's declared file scope?
+   - **Security**: Hardcoded secrets, injection vulnerabilities, unsafe patterns.
+   - **Style**: Consistent with project conventions.
+   - **Conflicts with other sub-tasks**: Changes that would cause semantic conflicts even if git merge succeeds.
+
+   If issues are found:
+   - For **minor issues** (style, naming) → note them but proceed with merge. Fix post-merge if needed.
+   - For **significant issues** (scope violation, bugs, security) → attempt automated fix:
+     1. Call `mcp__vibe_kanban__create_session(workspace_id = SUB_ISSUES["SUB-NNN"].workspace_id)`.
+     2. Call `mcp__vibe_kanban__run_session_prompt(session_id = <new>, prompt = "Code review 发现以下问题，请修复后 push:\n{issue_list}")`.
+     3. Wait for the fix (re-enter monitoring for this sub-task, max 5 poll iterations).
+     4. Re-fetch and re-review the branch.
+   - If **AUTO_PROCEED = false** (root session) and the issue is critical → inform the user and ask for guidance.
+   - If **AUTO_PROCEED = true** (sub-orchestrator) and fix fails after retry → proceed with merge but log the issue in the task notes.
+
+4. **Merge** in **topological order** of the dependency DAG (dependencies first):
    ```bash
    git merge origin/{sub-branch-1} --no-ff --no-edit
    ```
    - If the merge succeeds → run the verification command from the merge strategy (e.g. `bun run lint && bun run test`).
-   - If the merge has conflicts → abort and **STOP**:
-     ```bash
-     git merge --abort
-     ```
-     Output:
-     ```
-     Merge 冲突：{sub-branch} → {CURRENT_BRANCH}
-     冲突文件：
-     - {file1}
-     - {file2}
-     已执行 git merge --abort 回滚。请选择：
-     1. 手动解决冲突后回复 `继续`
-     2. 跳过此子任务回复 `跳过 {SUB-NNN}`
-     ```
-     Wait for user to resolve and confirm before continuing.
-   - If verification fails after a successful merge → output the failure details and ask user:
-     ```
-     合并 {sub-branch} 后验证失败：
-     {failure details}
-     请选择：
-     1. `reset` — 回退到合并前状态（git reset --hard HEAD~1）
-     2. `继续` — 保留合并，手动修复后回复
-     ```
-     If user chooses `reset`, run `git reset --hard HEAD~1` and skip this sub-branch.
+   - If the merge has conflicts:
+     - **If `AUTO_PROCEED = true`** (sub-orchestrator): attempt auto-resolution. If unable, abort and mark as failed.
+     - **If `AUTO_PROCEED = false`** (root session): abort and **STOP**:
+       ```bash
+       git merge --abort
+       ```
+       Output:
+       ```
+       Merge 冲突：{sub-branch} → {CURRENT_BRANCH}
+       冲突文件：
+       - {file1}
+       - {file2}
+       已执行 git merge --abort 回滚。请选择：
+       1. 手动解决冲突后回复 `继续`
+       2. 跳过此子任务回复 `跳过 {SUB-NNN}`
+       ```
+       Wait for user to resolve and confirm before continuing.
+   - If verification fails after a successful merge:
+     - **If `AUTO_PROCEED = true`** (sub-orchestrator): attempt to fix the issue directly. If unable after one attempt, log the failure and continue with remaining merges.
+     - **If `AUTO_PROCEED = false`** (root session): output the failure details and ask user:
+       ```
+       合并 {sub-branch} 后验证失败：
+       {failure details}
+       请选择：
+       1. `reset` — 回退到合并前状态（git reset --hard HEAD~1）
+       2. `继续` — 保留合并，手动修复后回复
+       ```
+       If user chooses `reset`, run `git reset --hard HEAD~1` and skip this sub-branch.
 
-4. After all branches are merged, run full verification:
+5. After all branches are merged, run full verification:
    ```bash
    {project test/lint/build commands}
    ```
@@ -480,7 +629,14 @@ When **all sub-tasks** are Done (or failed sub-tasks have been acknowledged):
    ```
    Skip if the team prefers to keep branches for audit.
 
-4. **Push or confirm:**
+4. **Push:**
+
+   **If `AUTO_PROCEED = true`** (sub-orchestrator): push automatically, no confirmation needed.
+   ```bash
+   git push origin {CURRENT_BRANCH}
+   ```
+
+   **If `AUTO_PROCEED = false`** (root session with user present):
    Output:
    ```
    所有子任务已合并到 {CURRENT_BRANCH}。是否 push 到 origin？回复 `push` 执行，或自行操作。
@@ -573,8 +729,12 @@ If any VKB call fails → log the error in the task detail Notes section. The do
 | `start_workspace` fails | MCP returns error | Log in task notes, inform user |
 | Sub-agent no progress | No new git commits for 3+ consecutive polls | `create_session` + `run_session_prompt("继续完成任务")`. Retry once. |
 | Sub-agent fails twice | No progress after 3 more polls post-retry | Mark sub-task failed in docs, inform user, continue other sub-tasks |
-| Merge conflict | `git merge` returns non-zero | Stop, output conflicting files, wait for user resolution |
+| Merge conflict | `git merge` returns non-zero | If `AUTO_PROCEED`: attempt auto-resolution, else stop and ask user |
 | Issue status mismatch | `update_issue(status=X)` fails | Call `list_issues` to discover valid statuses, retry with correct name |
+| Fission depth exceeded | `current_depth ≥ 3` | Force Path B (direct implementation), no further fission |
+| Total issue limit reached | Descendant count ≥ 30 | Stop fissioning, implement remaining work directly |
+| Sub-orchestrator fails | Orchestrator-type child issue marked failed | Log in parent task notes; if `AUTO_PROCEED=false`, inform user |
+| Code review finds issues | AI review detects bugs/security/scope violations | Create new session with fix prompt; retry once; proceed if still failing |
 
 ---
 
