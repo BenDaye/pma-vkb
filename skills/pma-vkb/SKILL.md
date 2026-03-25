@@ -1,6 +1,6 @@
 ---
 name: pma-vkb
-version: 2.0.0
+version: 2.1.0
 description: >
   Project development lifecycle management with a strict three-phase
   workflow (investigate → proposal → implement), file-based task tracking
@@ -53,7 +53,7 @@ When using recursive fission (sub-workspaces dispatching their own sub-workspace
 | **Max total issues per root task** | 30 | Before creating a child issue, count direct children via `list_issues(parent_issue_id=PARENT_ISSUE_ID)`. If the current parent already has children approaching the limit, stop fissioning. Since VKB only supports single-level parent queries, use a conservative estimate: `current_children_count × average_grandchildren ≤ 30`. |
 | **Max children per parent issue** | 8 | A single issue may have at most 8 direct child issues. |
 
-**Depth tracking**: Each orchestrator node template includes `{current_depth}` and `{root_issue_id}` variables. The root session sets depth = 0 and `root_issue_id` to `PARENT_ISSUE_ID`. Each fission increments depth by 1 and passes `root_issue_id` unchanged. When depth ≥ 3, the agent MUST use Path B (direct implementation) regardless of complexity.
+**Depth tracking**: Each orchestrator node template includes `{current_depth}` and `{root_issue_id}` variables. The root session sets depth = 0 and `root_issue_id` to `PARENT_ISSUE_ID`. Each fission increments depth by 1 and passes `root_issue_id` unchanged. When depth ≥ 3, the agent MUST use A-DIRECT (VKB-tracked direct implementation) regardless of complexity — no further fission allowed, but VKB issue is still created and tracked.
 
 ---
 
@@ -253,10 +253,12 @@ Based on investigation results, the agent evaluates the task's **fission level**
 
 | Level | Name | Criteria | Action |
 |-------|------|----------|--------|
-| **DIRECT** | 直接实现 | ≤ 5 files AND single module/bounded context | Use Path B (direct implementation) |
-| **FISSION** | 裂变 | Can be split into ≥ 2 sub-tasks with disjoint file sets/modules | Split into sub-tasks via Path A. Each sub-task is classified as leaf or orchestrator (see 3.2.2). |
+| **FISSION** | 裂变 | Can be split into ≥ 2 sub-tasks with disjoint file sets/modules | Split into sub-tasks. Each sub-task is classified as leaf or orchestrator (see 3.2.2). |
+| **DIRECT** | 直接实现 | ≤ 3 files AND single module/bounded context AND no cross-cutting concerns | Implement directly without sub-task splitting. |
 
-The agent chooses DIRECT when possible. FISSION is used whenever the task is too large for direct implementation.
+The agent **prefers FISSION when feasible**. DIRECT is reserved for truly simple, self-contained changes (e.g. single-file bug fix, config tweak, documentation update). When in doubt, choose FISSION — over-splitting is cheaper than under-splitting because leaf executors handle small tasks efficiently.
+
+**Note**: Fission level only determines whether to split into sub-tasks. It does NOT determine whether to use VKB — VKB issue tracking is always used when `VKB_MODE = true`, regardless of fission level (see Step 4).
 
 **Key principle**: Each sub-task dispatched to a workspace runs the **same SKILL.md**. A sub-task classified as "orchestrator node" will run its own fission judgment — the recursive model handles multi-level decomposition naturally. The orchestrator only plans **one level down**.
 
@@ -317,42 +319,32 @@ On receiving `proceed` (or `开始实现` or equivalent confirmation), or when `
 
 First, determine which implementation path to take:
 
-- **Path A (VKB Orchestration)**: `VKB_MODE = true` AND fission level is FISSION (Section 3.2.1).
-- **Path B (PMA-only)**: `VKB_MODE = false` OR fission level is DIRECT (no sub-task table).
+- **Path A (VKB-Tracked)**: `VKB_MODE = true` — always used when VKB is available. Path A has two sub-paths based on fission level:
+  - **Path A-FISSION**: fission level is FISSION → create/link VKB issue, then orchestrate sub-workspaces (Steps A1 → A2 → A3 → AF1–AF8).
+  - **Path A-DIRECT**: fission level is DIRECT → create/link VKB issue, implement directly in this workspace (Steps A1 → A2 → A3 → AD1–AD5).
+- **Path B (PMA-only)**: `VKB_MODE = false` — used only when VKB MCP is unavailable.
 
-### Why Path A and Path B are mutually exclusive
+### Path A sub-path behavior
 
-When VKB orchestration is active and sub-tasks have been defined, the main workspace acts purely as an **orchestrator** — it creates VKB issues, dispatches sub-workspaces, monitors progress, and merges branches. It does not write application code itself, because sub-workspace agents own the implementation and their branches would conflict with direct edits on the main branch.
+| Sub-path | VKB Issue | Sub-issues | Implementation | Code written by |
+|----------|-----------|------------|----------------|-----------------|
+| A-FISSION | ✅ Created/linked | ✅ Created + dispatched | Sub-workspaces | Sub-workspace agents |
+| A-DIRECT | ✅ Created/linked | ❌ None | This workspace directly | This agent |
 
-The only code the main workspace may write directly:
+**A-FISSION constraint**: When sub-tasks have been dispatched, the main workspace acts purely as an **orchestrator** — it does not write application code itself, because sub-workspace agents own the implementation and their branches would conflict with direct edits on the main branch. The only code the main workspace may write directly:
 - `docs/task/` and `docs/plan/` files
 - Project scaffolding that must exist before sub-tasks can run (e.g. `create-next-app` initialization, `package.json`, base config files)
 - Merge commits when combining sub-task branches
 
 ---
 
-### Path A: VKB Orchestration
+### Path A: VKB-Tracked Implementation
 
-#### A1. Claim Task in Docs
-
-1. Update `docs/task/index.md`: change the task marker from `[ ]` to `[-]`.
-2. Update the task detail file: set `status: in_progress`, set `owner: pma-vkb-orchestrator`.
-3. If a plan exists, update `docs/plan/index.md`: change `[ ]` to `[-]`. Update plan detail: set `status: implementing`.
-
-#### A2. Create Sub-Task Docs
-
-For each sub-task in the split table:
-1. Create `docs/task/SUB-NNN.md` using the Chinese template. Set `status: pending`, `priority` from the table, `blocked by` from the DAG.
-2. Append to `docs/task/index.md`:
-   ```
-   - [ ] [**SUB-NNN 标题**](SUB-NNN.md) `P1`
-   ```
-
-#### A3. Resolve or Create VKB Parent Issue
+#### A1. Resolve or Create VKB Parent Issue
 
 **If `ENTRY_MODE = "issue_driven"`** (workspace was started from an existing issue):
 - `PARENT_ISSUE_ID` is already set to `LINKED_ISSUE_ID` from Step 1.0.
-- Do NOT create a new issue. Skip to A4.
+- Do NOT create a new issue. Skip to A2.
 
 **If `ENTRY_MODE = "workspace_driven"`** (no pre-existing issue):
 - Call:
@@ -360,7 +352,7 @@ For each sub-task in the split table:
   mcp__vibe_kanban__create_issue(
     project_id = PROJECT_ID,
     title      = "{TASK_ID} {task title}",
-    description = "编排任务（main workspace 执行）。\n详见 docs/plan/PLAN-NNN.md",
+    description = "{task description}\n详见 docs/task/{TASK_ID}.md",
     priority   = "high"
   )
   ```
@@ -368,7 +360,7 @@ For each sub-task in the split table:
 
 Record `PARENT_ISSUE_ID` in the task detail file under Notes.
 
-#### A4. Link Main Workspace
+#### A2. Link Main Workspace
 
 **If `ENTRY_MODE = "issue_driven"`**: skip (workspace is already linked to the issue).
 
@@ -382,7 +374,77 @@ mcp__vibe_kanban__link_workspace_issue(
 
 This makes the current workspace the **main workspace** and the current session the **main session**. The parent issue status will auto-change to "In progress".
 
-#### A5. Create VKB Child Issues
+#### A3. Branch Point — FISSION or DIRECT
+
+**If fission level is DIRECT** → follow A-DIRECT flow below.
+
+**If fission level is FISSION** → follow A-FISSION flow (starting at AF1).
+
+---
+
+#### A-DIRECT Flow (VKB-Tracked Direct Implementation)
+
+When `VKB_MODE = true` but the task is simple enough for direct implementation:
+
+##### AD1. Claim Task in Docs
+
+1. Update `docs/task/index.md`: change the task marker from `[ ]` to `[-]`.
+2. Update the task detail file: set `status: in_progress`, set `owner: pma-agent`.
+3. If a plan exists, update `docs/plan/index.md`: change `[ ]` to `[-]`. Update plan detail: set `status: implementing`.
+
+##### AD2. Implement
+
+Follow the approved proposal step by step. After each significant change, run focused verification (compile, lint, relevant tests).
+
+##### AD3. Verify
+
+Run full project verification (test suite, lint, build).
+
+##### AD4. Complete
+
+1. `docs/task/{TASK_ID}.md`: set `status: completed`.
+2. `docs/task/index.md`: `[-]` → `[x]`.
+3. If plan exists: `docs/plan/PLAN-NNN.md` → `status: completed`, `docs/plan/index.md` → `[x]`.
+4. `docs/changelog.md`: append entry.
+5. Update VKB issue:
+   ```
+   mcp__vibe_kanban__update_issue(
+     issue_id = PARENT_ISSUE_ID,
+     status   = "Done"
+   )
+   ```
+
+##### AD5. Push
+
+**If `AUTO_PROCEED = true`**: push automatically.
+```bash
+git push origin {CURRENT_BRANCH}
+```
+
+**If `AUTO_PROCEED = false`**: ask user before pushing.
+
+**End of A-DIRECT flow.** Skip to "Status Sync Rules".
+
+---
+
+#### A-FISSION Flow (VKB Orchestration with Sub-Workspaces)
+
+##### AF1. Claim Task in Docs
+
+1. Update `docs/task/index.md`: change the task marker from `[ ]` to `[-]`.
+2. Update the task detail file: set `status: in_progress`, set `owner: pma-vkb-orchestrator`.
+3. If a plan exists, update `docs/plan/index.md`: change `[ ]` to `[-]`. Update plan detail: set `status: implementing`.
+
+##### AF2. Create Sub-Task Docs
+
+For each sub-task in the split table:
+1. Create `docs/task/SUB-NNN.md` using the Chinese template. Set `status: pending`, `priority` from the table, `blocked by` from the DAG.
+2. Append to `docs/task/index.md`:
+   ```
+   - [ ] [**SUB-NNN 标题**](SUB-NNN.md) `P1`
+   ```
+
+##### AF3. Create VKB Child Issues
 
 For each sub-task in the split table, render the issue description based on its **type** (from Section 3.2.2):
 
@@ -401,7 +463,7 @@ mcp__vibe_kanban__create_issue(
 ```
 → Store each returned `issue_id` in a map: `SUB_ISSUES[SUB-NNN] = {issue_id, type: "leaf"|"orchestrator", branch: null, workspace_id: null}`.
 
-#### A6. Create Blocking Relationships
+##### AF4. Create Blocking Relationships
 
 For each dependency pair in the DAG (e.g. SUB-001 blocks SUB-002):
 ```
@@ -412,7 +474,7 @@ mcp__vibe_kanban__create_issue_relationship(
 )
 ```
 
-#### A7. Dispatch Sub Workspaces
+##### AF5. Dispatch Sub Workspaces
 
 Identify sub-tasks with **no unresolved dependencies** (nothing blocks them, or all blockers are already Done).
 
@@ -431,7 +493,7 @@ Then update docs:
 1. `docs/task/SUB-NNN.md`: set `status: in_progress`, set `owner: vkb-workspace`.
 2. `docs/task/index.md`: change `[ ]` to `[-]` for this sub-task.
 
-#### A8. Monitoring Loop
+##### AF6. Monitoring Loop
 
 **Hard limits**: Maximum **20 poll iterations**. Each iteration starts with a `sleep` of at least **60 seconds** (increase if sub-tasks are large). If all 20 iterations are exhausted without completion, STOP and inform the user.
 
@@ -475,7 +537,7 @@ When a sub-task's VKB status is Done:
 
 For each sub-task still in "pending" state:
 - Check if ALL its blocking dependencies are now Done.
-- If yes → dispatch it (same as Step A7).
+- If yes → dispatch it (same as AF5).
 
 **Step 8e — Handle stalls:**
 
@@ -533,7 +595,7 @@ If 20 iterations are exhausted:
   请检查未完成的子任务后回复 `继续监控` 或 `跳到合并`。
   ```
 
-#### A9. Review & Merge Phase
+##### AF7. Review & Merge Phase
 
 When **all sub-tasks** are Done (or failed sub-tasks have been acknowledged):
 
@@ -604,7 +666,7 @@ When **all sub-tasks** are Done (or failed sub-tasks have been acknowledged):
    {project test/lint/build commands}
    ```
 
-#### A10. Cleanup and Completion
+##### AF8. Cleanup and Completion
 
 1. **Archive all sub workspaces:**
    For each sub-task with a workspace_id:
@@ -675,7 +737,7 @@ When **all sub-tasks** are Done (or failed sub-tasks have been acknowledged):
 
 ---
 
-### Path B: PMA-Only Implementation
+### Path B: PMA-Only Implementation (VKB Unavailable)
 
 #### B1. Claim Task
 
@@ -706,13 +768,14 @@ Direction:
 - **Orchestrator's own operations**: docs first → then sync to VKB.
 - **Sub-agent completion**: VKB issue status is authoritative → orchestrator syncs back to docs.
 
-| Timing | docs action | VKB action |
-|--------|------------|------------|
-| Task created | Create `docs/task/PREFIX-NNN.md` + append index | `create_issue(...)` |
-| Task claimed | `[ ]` → `[-]`, status: in_progress | `link_workspace_issue(...)` (auto sets "In progress") |
-| Sub-task dispatched | `[ ]` → `[-]` for sub-task | `start_workspace(issue_id=...)` (auto sets "In progress") |
-| Sub-task done | `[-]` → `[x]`, status: completed | `update_issue(status="Done")` |
-| Parent task done | `[-]` → `[x]`, status: completed | `update_issue(status="Done")` |
+| Timing | docs action | VKB action (Path A only) |
+|--------|------------|--------------------------|
+| Task created | Create `docs/task/PREFIX-NNN.md` + append index | `create_issue(...)` (A3) |
+| Task claimed | `[ ]` → `[-]`, status: in_progress | `link_workspace_issue(...)` (A4, auto sets "In progress") |
+| Direct task done (A-DIRECT) | `[-]` → `[x]`, status: completed | `update_issue(status="Done")` (AD4) |
+| Sub-task dispatched (A-FISSION) | `[ ]` → `[-]` for sub-task | `start_workspace(issue_id=...)` (auto sets "In progress") |
+| Sub-task done (A-FISSION) | `[-]` → `[x]`, status: completed | `update_issue(status="Done")` |
+| Parent task done (A-FISSION) | `[-]` → `[x]`, status: completed | `update_issue(status="Done")` (AF8) |
 | Task closed | `[-]` → `[~]`, status: closed | (optional) `update_issue(...)` |
 
 If any VKB call fails → log the error in the task detail Notes section. The docs state remains valid. Retry on next opportunity.
@@ -723,16 +786,16 @@ If any VKB call fails → log the error in the task detail Notes section. The do
 
 | Scenario | Detection | Recovery |
 |----------|-----------|----------|
-| VKB MCP unavailable | `list_organizations()` fails | Set `VKB_MODE=false`, use Path B |
-| No matching project | `list_projects()` returns no match | Ask user; if none, Path B |
+| VKB MCP unavailable | `list_organizations()` fails | Set `VKB_MODE=false`, use Path B (PMA-only) |
+| No matching project | `list_projects()` returns no match | Ask user; if none, set `VKB_MODE=false`, use Path B |
 | No matching repo | `list_repos()` returns no match | Ask user to confirm repo |
 | `start_workspace` fails | MCP returns error | Log in task notes, inform user |
 | Sub-agent no progress | No new git commits for 3+ consecutive polls | `create_session` + `run_session_prompt("继续完成任务")`. Retry once. |
 | Sub-agent fails twice | No progress after 3 more polls post-retry | Mark sub-task failed in docs, inform user, continue other sub-tasks |
 | Merge conflict | `git merge` returns non-zero | If `AUTO_PROCEED`: attempt auto-resolution, else stop and ask user |
 | Issue status mismatch | `update_issue(status=X)` fails | Call `list_issues` to discover valid statuses, retry with correct name |
-| Fission depth exceeded | `current_depth ≥ 3` | Force Path B (direct implementation), no further fission |
-| Total issue limit reached | Descendant count ≥ 30 | Stop fissioning, implement remaining work directly |
+| Fission depth exceeded | `current_depth ≥ 3` | Force A-DIRECT (VKB-tracked direct implementation), no further fission |
+| Total issue limit reached | Descendant count ≥ 30 | Stop fissioning, use A-DIRECT for remaining work |
 | Sub-orchestrator fails | Orchestrator-type child issue marked failed | Log in parent task notes; if `AUTO_PROCEED=false`, inform user |
 | Code review finds issues | AI review detects bugs/security/scope violations | Create new session with fix prompt; retry once; proceed if still failing |
 
