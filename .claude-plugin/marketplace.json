@@ -8,7 +8,7 @@
       "name": "pma-vkb",
       "source": "./",
       "description": "Project management + Vibe Kanban orchestration plugin with three-phase workflow, recursive fission, and parallel agent dispatch",
-      "version": "2.0.0",
+      "version": "2.1.0",
       "keywords": ["project-management", "task-tracking", "vibe-kanban", "multi-agent"]
     }
   ]
